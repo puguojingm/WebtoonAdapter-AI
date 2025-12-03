@@ -1,161 +1,196 @@
-import { GoogleGenAI } from "@google/genai";
-import { MAIN_AGENT_SYSTEM_PROMPT, BREAKDOWN_ALIGNER_PROMPT, WEBTOON_ALIGNER_PROMPT } from '../constants';
-import { AgentType } from '../types';
 
-// Initialize Gemini Client
-// NOTE: Process.env.API_KEY is assumed to be available.
+import { GoogleGenAI } from "@google/genai";
+import { 
+  BREAKDOWN_WORKER_PROMPT, 
+  BREAKDOWN_ALIGNER_PROMPT, 
+  SCRIPT_WORKER_PROMPT, 
+  WEBTOON_ALIGNER_PROMPT,
+  ADAPT_METHOD,
+  OUTPUT_STYLE,
+  PLOT_TEMPLATE,
+  SCRIPT_TEMPLATE 
+} from '../constants';
+import { NovelChapter, PlotPoint } from '../types';
+
 const apiKey = process.env.API_KEY || ''; 
 const ai = new GoogleGenAI({ apiKey });
 
-// Helper to clean response text
-const cleanText = (text: string | undefined) => text || "Error: No response generated.";
+const cleanText = (text: string | undefined) => text || "";
 
-/**
- * Main Agent: Chat / Orchestration
- */
-export const sendToMainAgent = async (
-  history: { role: string; parts: { text: string }[] }[],
-  newMessage: string,
-  context: string
-): Promise<string> => {
-  try {
-    const model = 'gemini-2.5-flash'; 
-    const systemInstruction = `${MAIN_AGENT_SYSTEM_PROMPT}\n\nCurrent Context:\n${context}`;
+// Helper: Agent Execution Loop
+async function agentLoop(
+  workerSystemPrompt: string,
+  alignerSystemPrompt: string,
+  workerTaskPrompt: string,
+  alignerContextPrompt: (output: string) => string,
+  maxRetries = 3,
+  onProgress?: (status: string) => void
+): Promise<{ content: string; status: 'PASS' | 'FAIL'; report: string }> {
+  
+  let currentOutput = "";
+  let feedback = "";
+  let retries = 0;
 
-    // Replay history to state (simplified for demo, ideally we maintain a persistent chat object)
-    // We only send the last few turns to save tokens if history is long, 
-    // but for this app we need context.
+  while (retries < maxRetries) {
+    // 1. Worker Step
+    onProgress?.(retries === 0 ? "Worker: Generating content..." : `Worker: Refining content (Attempt ${retries + 1})...`);
     
-    // Let's iterate history to seed the chat
-    const prompt = `
-    HISTORY:
-    ${history.map(h => `${h.role}: ${h.parts[0].text}`).join('\n')}
-    
-    USER NEW MESSAGE:
-    ${newMessage}
-    `;
-
-    const result = await ai.models.generateContent({
-        model,
-        contents: prompt,
-        config: { systemInstruction }
-    });
-
-    return cleanText(result.text);
-
-  } catch (error) {
-    console.error("Main Agent Error:", error);
-    return "❌ 主Agent暂时无法连接，请检查API Key或网络连接。";
-  }
-};
-
-/**
- * Breakdown Aligner: Quality Check
- */
-export const runBreakdownAligner = async (
-  breakdownContent: string,
-  originalNovelSegment: string
-): Promise<string> => {
-  try {
-    const prompt = `
-    TASK: Perform a quality check on the following Plot Breakdown based on the provided Novel Content.
-    
-    NOVEL CONTENT (Source):
-    ${originalNovelSegment.substring(0, 5000)}... (truncated for context)
-    
-    PLOT BREAKDOWN (Target):
-    ${breakdownContent}
-    `;
-
-    const result = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: prompt,
-        config: { systemInstruction: BREAKDOWN_ALIGNER_PROMPT }
-    });
-
-    return cleanText(result.text);
-  } catch (error) {
-    console.error("Breakdown Aligner Error:", error);
-    return "❌ Aligner Error: 无法执行检查。";
-  }
-};
-
-/**
- * Webtoon Aligner: Consistency Check
- */
-export const runWebtoonAligner = async (
-  scriptContent: string,
-  breakdownContext: string
-): Promise<string> => {
-  try {
-    const prompt = `
-    TASK: Perform a consistency check on the following Script Episode.
-    
-    PLOT BREAKDOWN (Reference):
-    ${breakdownContext}
-    
-    SCRIPT CONTENT (Target):
-    ${scriptContent}
-    `;
-
-    const result = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: prompt,
-        config: { systemInstruction: WEBTOON_ALIGNER_PROMPT }
-    });
-
-    return cleanText(result.text);
-  } catch (error) {
-    console.error("Webtoon Aligner Error:", error);
-    return "❌ Aligner Error: 无法执行检查。";
-  }
-};
-
-/**
- * Specific Task: Generate Breakdown (Direct Call)
- */
-export const generateBreakdownDirectly = async (novelContent: string, type: string): Promise<string> => {
-    try {
-        const prompt = `
-        Context: The novel type is ${type}.
-        Task: Perform plot breakdown for the following novel content (approx 6 chapters).
-        Requirements: Extract conflicts, identify hooks, assign episodes (1-3 points per episode).
-        
-        NOVEL CONTENT:
-        ${novelContent.substring(0, 15000)}
-        `;
-
-        const result = await ai.models.generateContent({
-            model: 'gemini-2.5-flash',
-            contents: prompt,
-            config: { systemInstruction: MAIN_AGENT_SYSTEM_PROMPT }
-        });
-        return cleanText(result.text);
-    } catch (e) {
-        console.error("Generate Breakdown Error:", e);
-        return "Error generating breakdown.";
+    let fullWorkerPrompt = workerTaskPrompt;
+    if (feedback) {
+      fullWorkerPrompt += `\n\n[Previous Feedback - Please Fix]\n${feedback}`;
     }
+
+    try {
+      const workerRes = await ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: fullWorkerPrompt,
+        config: { systemInstruction: workerSystemPrompt }
+      });
+      currentOutput = cleanText(workerRes.text);
+    } catch (e) {
+      return { content: currentOutput, status: 'FAIL', report: "API Error during generation." };
+    }
+
+    // 2. Aligner Step
+    onProgress?.("Aligner: Checking quality...");
+    const alignerPrompt = alignerContextPrompt(currentOutput);
+    
+    try {
+      const alignerRes = await ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: alignerPrompt,
+        config: { systemInstruction: alignerSystemPrompt }
+      });
+      const report = cleanText(alignerRes.text);
+
+      if (report.includes("PASS")) {
+        return { content: currentOutput, status: 'PASS', report };
+      } else {
+        feedback = report;
+        retries++;
+      }
+    } catch (e) {
+       // If aligner fails, we assume pass to avoid getting stuck, or return fail.
+       return { content: currentOutput, status: 'FAIL', report: "API Error during alignment." };
+    }
+  }
+
+  return { content: currentOutput, status: 'FAIL', report: "Max retries reached. Last feedback: " + feedback };
 }
 
 /**
- * Specific Task: Generate Script (Direct Call)
+ * Breakdown Agent Loop
  */
-export const generateScriptDirectly = async (breakdownPoints: string, episodeNum: number): Promise<string> => {
-    try {
-        const prompt = `
-        Task: Write the script for Episode ${episodeNum}.
-        Use the following plot points:
-        ${breakdownPoints}
-        `;
+export const generateBreakdownBatch = async (
+  chapters: NovelChapter[],
+  novelType: string,
+  onUpdate: (msg: string) => void
+) => {
+  const chapterText = chapters.map(c => `Chapter ${c.name}:\n${c.content}`).join("\n\n");
+  
+  const workerTask = `
+  NOVEL TYPE: ${novelType}
+  
+  TASK: Breakdown the following 6 chapters into plot points.
+  
+  CONTEXT (Adapt Method):
+  ${ADAPT_METHOD}
+  
+  TEMPLATE:
+  ${PLOT_TEMPLATE}
+  
+  NOVEL CONTENT:
+  ${chapterText.substring(0, 30000)} 
+  `;
 
-        const result = await ai.models.generateContent({
-            model: 'gemini-2.5-flash',
-            contents: prompt,
-            config: { systemInstruction: MAIN_AGENT_SYSTEM_PROMPT }
-        });
-        return cleanText(result.text);
-    } catch (e) {
-        console.error("Generate Script Error:", e);
-        return "Error generating script.";
+  const alignerPromptBuilder = (output: string) => `
+  TASK: Check the quality of this plot breakdown.
+  
+  ORIGINAL NOVEL:
+  ${chapterText.substring(0, 5000)}... (truncated)
+  
+  GENERATED BREAKDOWN:
+  ${output}
+  `;
+
+  return agentLoop(
+    BREAKDOWN_WORKER_PROMPT,
+    BREAKDOWN_ALIGNER_PROMPT,
+    workerTask,
+    alignerPromptBuilder,
+    3,
+    onUpdate
+  );
+};
+
+/**
+ * Script Agent Loop
+ */
+export const generateScriptEpisode = async (
+  episodeNum: number,
+  plotPoints: PlotPoint[],
+  relatedChapters: string, // content of relevant chapters
+  onUpdate: (msg: string) => void
+) => {
+  const plotText = plotPoints.map(p => p.content).join("\n");
+  
+  const workerTask = `
+  TASK: Write Script for Episode ${episodeNum}.
+  
+  PLOT POINTS:
+  ${plotText}
+  
+  SOURCE NOVEL CONTENT:
+  ${relatedChapters.substring(0, 20000)}
+  
+  KNOWLEDGE (Method & Style):
+  ${ADAPT_METHOD}
+  ${OUTPUT_STYLE}
+  
+  TEMPLATE:
+  ${SCRIPT_TEMPLATE}
+  `;
+
+  const alignerPromptBuilder = (output: string) => `
+  TASK: Check consistency of this script.
+  
+  PLOT POINTS:
+  ${plotText}
+  
+  GENERATED SCRIPT:
+  ${output}
+  `;
+
+  return agentLoop(
+    SCRIPT_WORKER_PROMPT,
+    WEBTOON_ALIGNER_PROMPT,
+    workerTask,
+    alignerPromptBuilder,
+    3,
+    onUpdate
+  );
+};
+
+// Parser Helpers
+export const parsePlotPoints = (text: string, batchIdx: number): PlotPoint[] => {
+  const lines = text.split('\n');
+  const points: PlotPoint[] = [];
+  const regex = /【(剧情\d+)】(.*?)，(.*?)(?:，|,)第(\d+)集(?:，|,)状态[：:](.*)/;
+
+  lines.forEach(line => {
+    const match = line.match(regex);
+    if (match) {
+      points.push({
+        id: match[1],
+        content: line,
+        scene: match[2].trim(), // Simplified parsing
+        action: match[3].trim(),
+        hookType: "Extract from action if needed",
+        episode: parseInt(match[4]),
+        status: 'unused',
+        batchIndex: batchIdx
+      });
     }
-}
+  });
+  return points;
+};

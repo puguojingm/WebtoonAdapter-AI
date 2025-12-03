@@ -35,7 +35,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ project, onViewChange, current
           </div>
           <div className="text-xs text-indigo-400 mt-1 flex justify-between">
             <span>{project.type || '未定类型'}</span>
-            <span>{project.files.length} 个文件</span>
+            <span>{project.chapters.length} 个文件</span>
           </div>
         </div>
       </div>
